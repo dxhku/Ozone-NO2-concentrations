@@ -1,5 +1,5 @@
 ﻿# Ozone-NO2-concentrations
- ## Downlad urls
+ ## Download urls
  ### NO2
  Hong Kong from May 2020 to December 2023. https://we.tl/eY7Dusk9Mx
  ## Data Availability
