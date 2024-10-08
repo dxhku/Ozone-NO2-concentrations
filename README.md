@@ -3,7 +3,7 @@
  ### NO<sub>2</sub>
  * Hong Kong from May 2020 to December 2023. https://we.tl/eY7Dusk9Mx
  ## Accuracy Metrics
- Scatter plots of cross-validation (CV) and perdition results for the GTWR-STK model. The scatter frequency is indicated by different colors. The dashed and solid lines represent the 1:1 line and the linear regression line, respectively. Y is prediction  NO<sub>2</sub>/zone and X is observed NO<sub>2</sub>/zone.
+ Scatter plots of cross-validation (CV) and perdition results for the GTWR-STK model. The scatter frequency is indicated by different colors. The dashed and solid lines represent the 1:1 line and the linear regression line, respectively. Y is prediction Ozone/NO<sub>2</sub> and X is observed Ozone/NO<sub>2</sub>.
  ### NO<sub>2</sub>
 ![image](https://github.com/user-attachments/assets/1d9c5820-de38-44b7-b0c0-233938d3e7cd)
 
