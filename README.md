@@ -1,6 +1,6 @@
 ﻿# Ozone-NO2-concentrations
  ## Download urls
- ### NO2
+ ### NO<sub>2</sub>
  * Hong Kong from May 2020 to December 2023. https://we.tl/eY7Dusk9Mx
  ## Accuracy Metrics
  Scatter plots of cross-validation (CV) and perdition results for the GTWR-STK model. The scatter frequency is indicated by different colors. The dashed and solid lines represent the 1:1 line and the linear regression line, respectively. Y is prediction NO2 and X is observed NO2.
