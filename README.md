@@ -1,6 +1,6 @@
 ﻿# Ozone-NO<sub>2</sub>-concentrations
  ## Download urls
- Daily NO<sub>2</sub> and Ozone concentrations in Hong Kong (100m) and Taiwan (1km) from May 2020 to December 2023
+ Daily NO<sub>2</sub> and Ozone concentrations in Hong Kong (100m) and Taiwan (1km) from May 2020 to December 2023.
  https://portals.wetransfer.com/reviews/9f076e19-5d52-4757-8f8c-3e0742c68997
  ## Accuracy Metrics
  Scatter plots of cross-validation (CV) and perdition results for the GTWR-STK model. The scatter frequency is indicated by different colors. The dashed and solid lines represent the 1:1 line and the linear regression line, respectively. Y is prediction Ozone/NO<sub>2</sub> and X is observed Ozone/NO<sub>2</sub>.
