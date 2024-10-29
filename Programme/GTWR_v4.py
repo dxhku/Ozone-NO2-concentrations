@@ -680,7 +680,7 @@ if __name__ == '__main__':
     fitting_result.to_csv(fitting_file_path, mode='a', index=False, encoding='utf-8')
 
     ''' Save accuracy picture'''
-    accuracy_pic_path = os.path.join(gtwr_obj.accuracy_dir, 'result_gtwr_without.png')
+    accuracy_pic_path = os.path.join(gtwr_obj.accuracy_dir, 'result_gtwr.png')
     pic_params = (gtwr_obj.predict_item, 'gtwr', 'NO2')
     model_params = ((st_scale_optimal, q_num_optimal), gtwr_obj.aux_var_names)
     save_accurancy_pic(verify_result, fitting_result, accuracy_pic_path, pic_params, model_params)
