@@ -10,7 +10,10 @@ from shapely.geometry import Point
 import rasterio
 from numba import njit, prange
 from scipy.optimize import fmin
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import LinearRegression
 
 
 def count_inter_from_start(years, doys):
@@ -354,6 +357,58 @@ def gtwr_cv(points, cv, params, x_num, y_name):
     return all_results
 
 
+def save_accurancy_pic(data1, data2, save_path, pics, models=None):
+    real_name, pred_name, param_name = pics
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    if models:
+        fig.subplots_adjust(bottom=0.2)
+
+    titles = ["Verification Results", "Fitting Results"]
+    data_list = [data1, data2]
+
+    for i, (ax, data, title) in enumerate(zip(axes, data_list, titles)):
+        actual = data[real_name].values
+        predicted = data[pred_name].values
+
+        reg = LinearRegression()
+        reg.fit(actual.reshape(-1, 1), predicted)
+
+        r2 = r2_score(actual, predicted)
+        rmse = np.sqrt(mean_squared_error(actual, predicted))
+        mae = mean_absolute_error(actual, predicted)
+        mape = np.mean(np.abs((actual - predicted) / actual)) * 100
+
+        sns.scatterplot(x=actual, y=predicted, color='blue', s=10, alpha=0.5, edgecolor=None, ax=ax)
+        ax.plot([0, max(predicted)], [0, max(predicted)], 'k-', label='1:1 line')
+
+        x_vals = np.array(ax.get_xlim())
+        y_vals = reg.predict(x_vals.reshape(-1, 1))
+        ax.plot(x_vals, y_vals, 'c--', label=f"Y = {reg.coef_[0]:.2f}X + {reg.intercept_:.2f}")
+
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_xlim(0, min(max(actual), max(predicted)))
+        ax.set_ylim(0, min(max(actual), max(predicted)))
+
+        ax.text(0.05, 0.95, f'N = {len(actual)}', fontsize=10, transform=ax.transAxes)
+        ax.text(0.05, 0.90, f'R² = {r2:.2f}', fontsize=10, transform=ax.transAxes)
+        ax.text(0.05, 0.85, f'RMSE = {rmse:.2f}', fontsize=10, transform=ax.transAxes)
+        ax.text(0.05, 0.80, f'MAE = {mae:.2f}', fontsize=10, transform=ax.transAxes)
+        ax.text(0.05, 0.75, f'MAPE = {mape:.2f}%', fontsize=10, transform=ax.transAxes)
+
+        ax.set_xlabel(f'Actual {param_name} (μg/m³)')
+        ax.set_ylabel(f'Predicted {param_name} (μg/m³)')
+        ax.set_title(title)
+        ax.legend()
+
+    if models:
+        opt, aux_list = models
+        st_scale, q_num = opt
+        plt.figtext(0.5, 0.08, f'Optimal params -- scale: {st_scale}, q: {q_num}', ha="center", fontsize=10)
+        plt.figtext(0.5, 0.05, 'Auxiliary variables-- %s' % ', '.join(aux_list), ha="center", fontsize=10)
+
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+
 class Database:
     def __init__(self, db):
         self.db = db
@@ -460,6 +515,7 @@ class GTWR:
         self.predict_item = predict_item
         self.aux_var_list = aux_var_list
         self.aux_var_size = len(self.aux_var_list)
+        self.aux_var_names = [aux_var.name for aux_var in self.aux_var_list]
 
         self.st_var_list, self.known_points = None, None
 
@@ -606,7 +662,6 @@ if __name__ == '__main__':
     optimal_params = fmin(gtwr_obj.objective_function, initial_guess, disp=True)
     print(f"best st_scale: {optimal_params[0]}, best q_num: {int(optimal_params[1])}")
     st_scale_optimal, q_num_optimal = optimal_params[0], int(optimal_params[1])
-    # st_scale_optimal, q_num_optimal = 1, 20
 
     ''' Calculate verify matters for GTWR result '''
     verify_result = gtwr_cv(gtwr_obj.known_points, 10, (st_scale_optimal, q_num_optimal),
@@ -623,6 +678,12 @@ if __name__ == '__main__':
     with open(fitting_file_path, 'w', encoding='utf-8') as f:
         f.write(f"scale: {st_scale_optimal}, q: {q_num_optimal}\n")
     fitting_result.to_csv(fitting_file_path, mode='a', index=False, encoding='utf-8')
+
+    ''' Save accuracy picture'''
+    accuracy_pic_path = os.path.join(gtwr_obj.accuracy_dir, 'result_gtwr_without.png')
+    pic_params = (gtwr_obj.predict_item, 'gtwr', 'NO2')
+    model_params = ((st_scale_optimal, q_num_optimal), gtwr_obj.aux_var_names)
+    save_accurancy_pic(verify_result, fitting_result, accuracy_pic_path, pic_params, model_params)
 
     ''' Calculate Grid GTWR'''
     gtwr_obj.gtwr_grid((st_scale_optimal, q_num_optimal), PREDICT_TIME_RANGE)
