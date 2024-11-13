@@ -10,10 +10,16 @@ from shapely.geometry import Point
 import rasterio
 from numba import njit, prange
 from scipy.optimize import fmin
+from scipy.optimize import minimize
+from scipy.optimize import brute
+from skopt.space import Real, Integer
+from skopt import gp_minimize
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import GroupKFold, KFold
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.linear_model import LinearRegression
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 
 def count_inter_from_start(years, doys):
@@ -98,15 +104,19 @@ def normalize_data(input_data, params_data):
        The input dataframe with normalized values for specified columns.
    """
     for param in params_data:
-        original_min, original_max = param.normal_params[0]
-        original_abs = max(abs(original_min), abs(original_max))
-        if original_min * original_max < 0:
-            original_min, original_max = -original_abs, original_abs
-        target_min, target_max = param.normal_params[1]
+        # original_min, original_max = param.normal_params[0]
+        # original_abs = max(abs(original_min), abs(original_max))
+        # if original_min * original_max < 0:
+        #     original_min, original_max = -original_abs, original_abs
+        # target_min, target_max = param.normal_params[1]
+        #
+        # # Standardization formula
+        # input_data[param.name] = ((input_data[param.name] - original_min) / (original_max - original_min)) * (
+        #             target_max - target_min) + target_min
 
-        # Standardization formula
-        input_data[param.name] = ((input_data[param.name] - original_min) / (original_max - original_min)) * (
-                    target_max - target_min) + target_min
+        target_min, target_max = 0, 1
+        input_data[param.name] = (input_data[param.name] - param.normal_params[0]) / (param.normal_params[1] - param.normal_params[0])
+
     return input_data
 
 
@@ -182,6 +192,7 @@ def st_distance(a_space, a_time, b_space, b_time, scale):
    st_dists : numpy.ndarray
        2D array of spatiotemporal distances.
    """
+    # Calculate spatial distances
     space_dists = np.sqrt(
         np.square(a_space[:, np.newaxis, 0] - b_space[np.newaxis, :, 0]) +
         np.square(a_space[:, np.newaxis, 1] - b_space[np.newaxis, :, 1])
@@ -189,6 +200,18 @@ def st_distance(a_space, a_time, b_space, b_time, scale):
 
     time_dists = np.abs(a_time[:, np.newaxis] - b_time[np.newaxis, :])
 
+    # Normalize
+    if NORMALIZE_SIGN:
+        min_space_dist = space_dists.min()
+        max_space_dist = space_dists.max()
+        if max_space_dist != min_space_dist:
+            space_dists = (space_dists - min_space_dist) / (max_space_dist - min_space_dist)
+        min_time_dist = time_dists.min()
+        max_time_dist = time_dists.max()
+        if max_time_dist != min_time_dist:
+            time_dists = (time_dists - min_time_dist) / (max_time_dist - min_time_dist)
+
+    # Combine distances with scaling factor applied to spatial distance
     st_dists = scale * space_dists + time_dists
 
     return st_dists
@@ -213,21 +236,25 @@ def gtwr_chunk(predict_points, known_points, params, x_num):
         A 1D array containing the predicted values for each point in `predict_points`.
     """
     scale, q = params
-    q = int(q)  # Ensure q is an integer
     n = predict_points.shape[0]  # Number of prediction points
 
     # Compute the spatiotemporal distance matrix between prediction and known points
-    distance_matrix = st_distance(predict_points[:, 3:5], predict_points[:, -1],
-                                  known_points[:, 3:5], known_points[:, -1], scale)
+    distance_matrix = st_distance(predict_points[:, 2:4], predict_points[:, -1],
+                                  known_points[:, 2:4], known_points[:, -1], scale)
 
     predictions = np.empty(n)
 
     for i in prange(n):  # Parallel loop for each prediction point
         distance = distance_matrix[i, :]
         distance[distance == 0] = np.inf  # Avoid division by zero for identical points
+        non_infinite_count = (~np.isinf(distance)).sum()
+        effective_q = min(q, non_infinite_count)
+        if effective_q < q:
+            predictions[i] = np.nan
+            continue
 
         # Get indices of q nearest neighbors
-        smallest_indices = np.argsort(distance)[:q]
+        smallest_indices = np.argsort(distance)[:effective_q]
         max_ds = distance[smallest_indices[-1]]  # Maximum distance among nearest neighbors
         distance = distance[smallest_indices]
 
@@ -236,9 +263,9 @@ def gtwr_chunk(predict_points, known_points, params, x_num):
         W_diag = np.diag(W)
 
         # Construct the design matrix X with intercept (first column = 1)
-        X = np.empty((q, x_num + 1))
+        X = np.empty((effective_q, x_num + 1))
         X[:, 0] = 1  # Intercept term
-        X[:, 1:] = known_points[smallest_indices, 5:x_num + 5]  # Use feature columns
+        X[:, 1:] = known_points[smallest_indices, 4:x_num + 4]  # Use feature columns
 
         y = known_points[smallest_indices, -2]  # Target variable (assumed to be in the second-to-last column)
 
@@ -248,7 +275,7 @@ def gtwr_chunk(predict_points, known_points, params, x_num):
         beta = np.linalg.pinv(XTWX) @ XTWy  # Compute regression coefficients
 
         # Predict value for the current point
-        X_with_intercept = np.concatenate((np.array([1]), predict_points[i, 5:x_num + 5]))
+        X_with_intercept = np.concatenate((np.array([1]), predict_points[i, 4:x_num + 4]))
         y_pred = X_with_intercept @ beta
         predictions[i] = y_pred
 
@@ -279,7 +306,7 @@ def gtwr(predict_points, known_points, params, x_num, batch_size=1000):
     q = int(q)
 
     # Handle invalid parameters by returning a large error value
-    if q <= 10 or scale <= 0:
+    if scale <= 0:
         return np.full(predict_points[:, 3].shape[0], 1e10)
 
     n = predict_points.shape[0]
@@ -289,7 +316,7 @@ def gtwr(predict_points, known_points, params, x_num, batch_size=1000):
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
         predict_points_chunk = predict_points[start:end]
-        chunk_predictions = gtwr_chunk(predict_points_chunk, known_points, params, x_num)
+        chunk_predictions = gtwr_chunk(predict_points_chunk, known_points, (scale, q), x_num)
         predictions[start:end] = chunk_predictions
 
     return predictions
@@ -318,8 +345,8 @@ def gtwr_cv(points, cv, params, x_num, y_name):
     # Calculate for fitting result
     if cv == 1:
         print(f'\rCalculate fitting result for sample data.', end='', flush=True)
-        test_result = gtwr(points.to_numpy().astype(np.float64),
-                           points.to_numpy().astype(np.float64),
+        test_result = gtwr(points.drop(columns=['id']).to_numpy().astype(np.float64),
+                           points.drop(columns=['id']).to_numpy().astype(np.float64),
                            params, x_num)
 
         # Create a copy of the group and store the GTWR predictions
@@ -328,16 +355,15 @@ def gtwr_cv(points, cv, params, x_num, y_name):
 
     # Calculate for verify result
     else:
-        count = 0
         # Iterate through training and test splits generated by a random CV splitter
+        st_scale, q = params
         for train_group, test_group in random_cross_validation_split(points, cv):
-            count += 1
-            print(f'\r{params}\tfor CV {count}', end='', flush=True)
+            print(f'\rFinding the Optimal Parameters - st_scale:{st_scale:.4f}, q:{int(q):2d}', end='', flush=True)
 
             # Perform GTWR for the test set
-            test_result = gtwr(test_group.to_numpy().astype(np.float64)[:, :-1],
-                               train_group.to_numpy().astype(np.float64),
-                               params, x_num)
+            test_result = gtwr(test_group.drop(columns=['id']).to_numpy().astype(np.float64)[:, :-1],
+                               train_group.drop(columns=['id']).to_numpy().astype(np.float64),
+                               (st_scale, q), x_num)
 
             # Create a copy of the test group and store the GTWR predictions
             result_df = test_group.copy()
@@ -351,8 +377,8 @@ def gtwr_cv(points, cv, params, x_num, y_name):
     elapsed_time = end_time - start_time
 
     # Compute the Root Mean Squared Error (RMSE) between actual and predicted values
-    rmse = np.sqrt(mean_squared_error(all_results[y_name], all_results['gtwr']))
-    print(f'\t{params}\ttime: {elapsed_time}s, RMSE: {rmse:.4f}')
+    rmse = np.sqrt(mean_squared_error(all_results.dropna()[y_name], all_results.dropna()['gtwr']))
+    print(f' >>>> time: {elapsed_time:.2f}s, RMSE: {rmse:.4f}')
 
     return all_results
 
@@ -367,8 +393,8 @@ def save_accurancy_pic(data1, data2, save_path, pics, models=None):
     data_list = [data1, data2]
 
     for i, (ax, data, title) in enumerate(zip(axes, data_list, titles)):
-        actual = data[real_name].values
-        predicted = data[pred_name].values
+        actual = data.dropna()[real_name].values
+        predicted = data.dropna()[pred_name].values
 
         reg = LinearRegression()
         reg.fit(actual.reshape(-1, 1), predicted)
@@ -403,7 +429,7 @@ def save_accurancy_pic(data1, data2, save_path, pics, models=None):
     if models:
         opt, aux_list = models
         st_scale, q_num = opt
-        plt.figtext(0.5, 0.08, f'Optimal params -- scale: {st_scale}, q: {q_num}', ha="center", fontsize=10)
+        plt.figtext(0.5, 0.08, f'Optimal params -- scale: {st_scale:.4f}, q: {q_num}', ha="center", fontsize=10)
         plt.figtext(0.5, 0.05, 'Auxiliary variables-- %s' % ', '.join(aux_list), ha="center", fontsize=10)
 
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -470,7 +496,7 @@ class Database:
         try:
             cursor.execute(sql_sen)
             rows = cursor.fetchall()
-            columns = [description[0] for description in cursor.description]  # 获取列名
+            columns = [description[0] for description in cursor.description]
             df = pd.DataFrame(rows, columns=columns)
             conn.commit()
             return df
@@ -480,15 +506,28 @@ class Database:
         finally:
             conn.close()
 
+    def csv_to_sqlite(self, csv_file, table_name):
+        df = pd.read_csv(csv_file)
+
+        conn = sqlite3.connect(self.db)
+        df.to_sql(table_name, conn, if_exists='replace', index=False)
+
+        conn.close()
+
 
 class AuxVar:
-    def __init__(self, name, time_sign, time_gap, normal_params, nan_data=None):
+    def __init__(self, name, time_sign, time_gap, normal_params=None, nan_data=None):
         self.name = name
         self.time_sign = time_sign
         self.time_gap = time_gap
         self.normal_params = normal_params
         if nan_data:
             self.nan_data = nan_data
+
+    def set_normal_params(self, database, table_name):
+        sql = f'select max({self.name}) as max, min({self.name}) as min from {table_name}'
+        max_min = database.execute_sql(sql)
+        self.normal_params = [max_min['min'].iloc[0], max_min['max'].iloc[0]]
 
 
 class GTWR:
@@ -519,13 +558,32 @@ class GTWR:
 
         self.st_var_list, self.known_points = None, None
 
-    def prepare_sample_data(self):
+    def set_spore(self, st_scale, q_num):
+        dir_name = f"scale{st_scale:.2f}_q{q_num}"
+        result_bath_dir = os.path.join(self.base_dir, "result")
+        self.result_dir = os.path.join(result_bath_dir, dir_name)
+        if not os.path.exists(result_bath_dir):
+            os.makedirs(result_bath_dir)
+        if not os.path.exists(self.result_dir):
+            os.makedirs(self.result_dir)
+        accuracy_bath_dir = os.path.join(self.base_dir, "accuracy")
+        self.accuracy_dir = os.path.join(accuracy_bath_dir, dir_name)
+        if not os.path.exists(self.accuracy_dir):
+            os.makedirs(self.accuracy_dir)
+
+    def prepare_sample_data(self, from_csv=None, table_name='sample_data'):
+        if from_csv:
+            self.db.csv_to_sqlite(from_csv, table_name)
         # Create SQL sentence and execute
         x_array, y_array = [aux_var.name for aux_var in self.aux_var_list], [self.predict_item]
         sql = 'select id, year, day, lon, lat, {} from sample_data'.format(','.join(x_array + y_array))
         sql_point = self.db.execute_sql(sql)
-
-        sql_point['times'] = count_inter_from_start(sql_point['year'].values, sql_point['day'].values)
+        if CHECK_COLLINEAR:
+            removes = self.remove_high_vif(sql_point)
+            sql_point = sql_point.drop(columns=removes)
+            self.aux_var_list = [aux_var for aux_var in self.aux_var_list if aux_var.name not in removes]
+            self.aux_var_names = [aux_var.name for aux_var in self.aux_var_list]
+            self.aux_var_size = len(self.aux_var_list)
 
         # Handling null values
         sql_point = sql_point.dropna()
@@ -533,21 +591,71 @@ class GTWR:
             if getattr(param, 'nan_data', None):
                 sql_point = sql_point[~sql_point[[param.name]].isin([param.nan_data]).any(axis=1)]
 
-        if NORMALIZE_SIGN is None:
-            return sql_point
-        else:
-            self.st_var_list = [AuxVar('lon', None, None, normal_params=[[self.minx, self.maxx], [0, 1]]),
-                                AuxVar('lat', None, None, normal_params=[[self.miny, self.maxy], [0, 1]]),
-                                AuxVar('times', None, None,
-                                       normal_params=[[sql_point['times'].min(), sql_point['times'].max()], [0, 1]])]
-            if NORMALIZE_SIGN == 'st':
-                return normalize_data(sql_point, self.st_var_list)
-            else:
-                return normalize_data(sql_point, self.st_var_list + self.aux_var_list)
+        sql_point['times'] = count_inter_from_start(sql_point['year'].values, sql_point['day'].values)
 
-    def objective_function(self, params):
+        if NORMALIZE_SIGN == 'all':
+            for aux_var in self.aux_var_list:
+                if aux_var.normal_params is None:
+                    aux_var.set_normal_params(self.db, table_name)
+            return normalize_data(sql_point, self.aux_var_list)
+        else:
+            return sql_point
+
+    def remove_high_vif(self, df, threshold=10):
+        def calculate_vif(df):
+            vif_data = pd.DataFrame()
+            vif_data['Feature'] = df.columns
+            vif_data['VIF'] = [variance_inflation_factor(df.values, i) for i in range(df.shape[1])]
+            return vif_data
+
+        df = df[self.aux_var_names]
+        df = df.dropna()
+        vif_data = calculate_vif(df)
+        removed_fefatures = []
+        while vif_data['VIF'].max() > threshold:
+            max_vif_feature = vif_data.loc[vif_data['VIF'].idxmax(), 'Feature']
+            removed_fefatures.append(max_vif_feature)
+            # print(f"Removing {max_vif_feature} with VIF: {vif_data['VIF'].max()}")
+
+            df = df.drop(columns=[max_vif_feature])
+
+            vif_data = calculate_vif(df)
+
+        print(vif_data)
+        print(f'Remove {removed_fefatures}')
+        return removed_fefatures
+
+    # RMSE
+    def objective_function_RMSE(self, params):
         predict = gtwr_cv(self.known_points, 10, params, self.aux_var_size, self.predict_item)
-        return mean_squared_error(predict[self.predict_item], predict['gtwr'])
+        return mean_squared_error(predict.dropna()[self.predict_item], predict.dropna()['gtwr'])
+
+    def save_result_each(self, params):
+        st_scale, q_num = params
+        self.set_spore(st_scale, q_num)     # Prepare store dir
+        # Calculate verify matters for GTWR result
+        print('Calculate verification result for sample data.\t', end='')
+        verify_result = gtwr_cv(self.known_points, 10, (st_scale, q_num),
+                                self.aux_var_size, self.predict_item)
+        verify_file_path = os.path.join(self.accuracy_dir, 'result_gtwr_verify.csv')
+        with open(verify_file_path, 'w', encoding='utf-8') as f:
+            f.write(f"scale: {st_scale}, q: {q_num}\n")
+        verify_result.to_csv(verify_file_path, mode='a', index=False, encoding='utf-8')
+
+        # Calculate fitting matters for GTWR result
+        fitting_result = gtwr_cv(self.known_points, 1, (st_scale, q_num),
+                                 self.aux_var_size, self.predict_item)
+        fitting_file_path = os.path.join(self.accuracy_dir, 'result_gtwr_fitting.csv')
+        with open(fitting_file_path, 'w', encoding='utf-8') as f:
+            f.write(f"scale: {st_scale}, q: {q_num}\n")
+        fitting_result.to_csv(fitting_file_path, mode='a', index=False, encoding='utf-8')
+
+        # Save accuracy picture
+        accuracy_pic_path = os.path.join(self.accuracy_dir,
+                                         f"scale{st_scale:.2f}_q{q_num}.png")
+        pic_params = (self.predict_item, 'gtwr', self.predict_item)
+        model_params = ((st_scale, q_num), self.aux_var_names)
+        save_accurancy_pic(verify_result, fitting_result, accuracy_pic_path, pic_params, model_params)
 
     def extract_data_from_grid(self, group, time):
         grid_points = gpd.read_file(self.shp_grid_point).drop(columns=['geometry'])
@@ -570,7 +678,7 @@ class GTWR:
                     raster_values = raster_data[rows, cols]
                     grid_points[param.name] = raster_values
 
-        desired_order = ['id', 'year', 'day', 'lon', 'lat'] + [aux_var.name for aux_var in self.aux_var_list]
+        desired_order = ['id', 'year', 'day', 'lon', 'lat'] + self.aux_var_names
         grid_points = grid_points[desired_order]
         grid_points['times'] = time
 
@@ -582,16 +690,10 @@ class GTWR:
 
         if NORMALIZE_SIGN is None:
             return grid_points
-        elif NORMALIZE_SIGN == 'st':
-            return normalize_data(grid_points, self.st_var_list)
-        else:
-            return normalize_data(grid_points, self.st_var_list + self.aux_var_list)
+        elif NORMALIZE_SIGN == 'all':
+            return normalize_data(grid_points, self.aux_var_list)
 
     def gtwr_grid(self, params, time_range=None):
-        gtwr_dir = os.path.join(self.result_dir, 'gtwr')
-        if not os.path.exists(gtwr_dir):
-            os.makedirs(gtwr_dir)
-
         sample_points_time = self.db.execute_sql('select distinct year, day from sample_data order by year, day')
         sample_points_time['times'] = count_inter_from_start(sample_points_time['year'].values, sample_points_time['day'].values)
 
@@ -605,12 +707,9 @@ class GTWR:
             predict_points = self.extract_data_from_grid(group, time)
 
             print(f'\rCalculate GTWR grid for {year}/{day} -- Calculate grid value', end='', flush=True)
-            predictions = gtwr(predict_points.to_numpy().astype(np.float64),
-                               self.known_points.to_numpy().astype(np.float64),
+            predictions = gtwr(predict_points.drop(columns=['id']).to_numpy().astype(np.float64),
+                               self.known_points.drop(columns=['id']).to_numpy().astype(np.float64),
                                params, self.aux_var_size)
-
-            if NORMALIZE_SIGN is not None:
-                predict_points = denormalize_data(predict_points, self.st_var_list)
 
             coords = predict_points[['lon', 'lat']].values
 
@@ -619,7 +718,7 @@ class GTWR:
                                    geometry=geometries)
             gdf.set_crs(epsg=4326, inplace=True)
 
-            output_file = os.path.join(gtwr_dir, f"gtwr_y{year}_d{day}.shp")
+            output_file = os.path.join(self.result_dir, f"gtwr_y{year}_d{day}.shp")
             gdf.to_file(output_file)
 
 
@@ -634,19 +733,21 @@ if __name__ == '__main__':
     # 'st'  - Only normalize spatial and temporal items.
     # 'all'  - Normalize independent variable and spatiotemporal items.
     NORMALIZE_SIGN = 'all'
+    # Eliminate variables with high collinearity
+    CHECK_COLLINEAR = True
 
     ''' Parameters of auxiliary variables '''
-    tno2 = AuxVar(name='tno2', time_sign='day', time_gap=1, normal_params=[[0, 2000], [0, 1]])
-    temp = AuxVar(name='temp', time_sign='day', time_gap=1, normal_params=[[270, 315], [0, 1]])
-    et = AuxVar(name='et', time_sign='day', time_gap=1, normal_params=[[-0.3, 0.3], [-1, 1]])
-    sp = AuxVar(name='sp', time_sign='day', time_gap=1, normal_params=[[70000, 11000], [0, 1]])
-    tp = AuxVar(name='tp', time_sign='day', time_gap=1, normal_params=[[0, 5], [0, 1]])
-    ws = AuxVar(name='ws', time_sign='day', time_gap=1, normal_params=[[0, 30], [0, 1]])
-    pop = AuxVar(name='pop', time_sign='year', time_gap=1, normal_params=[[0, 50000], [0, 1]])
-    building = AuxVar(name='building', time_sign='year', time_gap=1, normal_params=[[0, 5000000], [0, 1]])
-    road = AuxVar(name='road', time_sign='year', time_gap=1, normal_params=[[0, 5000], [0, 1]])
-    parking = AuxVar(name='parking', time_sign='year', time_gap=1, normal_params=[[0, 150], [0, 1]])
-    ndvi = AuxVar(name='ndvi', time_sign='day', time_gap=16, normal_params=[[-2000, 10000], [-1, 1]], nan_data=-3000)
+    tno2 = AuxVar(name='tno2', time_sign='day', time_gap=1)
+    temp = AuxVar(name='temp', time_sign='day', time_gap=1)
+    et = AuxVar(name='et', time_sign='day', time_gap=1)
+    sp = AuxVar(name='sp', time_sign='day', time_gap=1)
+    tp = AuxVar(name='tp', time_sign='day', time_gap=1)
+    ws = AuxVar(name='ws', time_sign='day', time_gap=1)
+    pop = AuxVar(name='pop', time_sign='year', time_gap=1)
+    building = AuxVar(name='building', time_sign='year', time_gap=1)
+    road = AuxVar(name='road', time_sign='year', time_gap=1)
+    parking = AuxVar(name='parking', time_sign='year', time_gap=1)
+    ndvi = AuxVar(name='ndvi', time_sign='day', time_gap=16, nan_data=-3000)
 
     ''' Create GTWR object '''
     gtwr_obj = GTWR(name='example',
@@ -655,36 +756,21 @@ if __name__ == '__main__':
                     aux_var_list=[tno2, temp, et, sp, tp, ws, pop, building, road, parking, ndvi])
 
     ''' Prepare the sample data'''
-    gtwr_obj.known_points = gtwr_obj.prepare_sample_data()
+    # gtwr_obj.known_points = gtwr_obj.prepare_sample_data()
+    gtwr_obj.known_points = gtwr_obj.prepare_sample_data(from_csv=r"example_data/sample_data_csv.csv",
+                                                         table_name='sample_data_csv')
 
     ''' Calculate the best params for GTWR model '''
-    initial_guess = [1, 20]
-    optimal_params = fmin(gtwr_obj.objective_function, initial_guess, disp=True)
+    search_space = [Real(0.00001, 1, name='st_scale'), Integer(10, 100, name='q_num')]
+    result = gp_minimize(gtwr_obj.objective_function_RMSE, search_space, n_calls=200, random_state=0)
+    initial_guess = result.x
+    optimal_params = fmin(gtwr_obj.objective_function_RMSE, initial_guess, disp=True)
     print(f"best st_scale: {optimal_params[0]}, best q_num: {int(optimal_params[1])}")
     st_scale_optimal, q_num_optimal = optimal_params[0], int(optimal_params[1])
 
-    ''' Calculate verify matters for GTWR result '''
-    verify_result = gtwr_cv(gtwr_obj.known_points, 10, (st_scale_optimal, q_num_optimal),
-                            gtwr_obj.aux_var_size, gtwr_obj.predict_item)
-    verify_file_path = os.path.join(gtwr_obj.accuracy_dir, 'result_gtwr_verify.csv')
-    with open(verify_file_path, 'w', encoding='utf-8') as f:
-        f.write(f"scale: {st_scale_optimal}, q: {q_num_optimal}\n")
-    verify_result.to_csv(verify_file_path, mode='a', index=False, encoding='utf-8')
+    ''' Save verification and fitting result for each time '''
+    gtwr_obj.save_result_each((st_scale_optimal, q_num_optimal))
 
-    ''' Calculate fitting matters for GTWR result'''
-    fitting_result = gtwr_cv(gtwr_obj.known_points, 1, (st_scale_optimal, q_num_optimal),
-                             gtwr_obj.aux_var_size, gtwr_obj.predict_item)
-    fitting_file_path = os.path.join(gtwr_obj.accuracy_dir, 'result_gtwr_fitting.csv')
-    with open(fitting_file_path, 'w', encoding='utf-8') as f:
-        f.write(f"scale: {st_scale_optimal}, q: {q_num_optimal}\n")
-    fitting_result.to_csv(fitting_file_path, mode='a', index=False, encoding='utf-8')
-
-    ''' Save accuracy picture'''
-    accuracy_pic_path = os.path.join(gtwr_obj.accuracy_dir, 'result_gtwr_without.png')
-    pic_params = (gtwr_obj.predict_item, 'gtwr', 'NO2')
-    model_params = ((st_scale_optimal, q_num_optimal), gtwr_obj.aux_var_names)
-    save_accurancy_pic(verify_result, fitting_result, accuracy_pic_path, pic_params, model_params)
-
-    ''' Calculate Grid GTWR'''
+    ''' Calculate Grid GTWR result'''
     gtwr_obj.gtwr_grid((st_scale_optimal, q_num_optimal), PREDICT_TIME_RANGE)
     print('\n---------- DONE ----------')
